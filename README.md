@@ -6,7 +6,7 @@
 
 
 
-[ダウンロードはこちら](https://github.com/yuratexi/m_split_timeline_aviutl2/releases/latest)
+[ダウンロードはこちら](https://github.com/yuratexi/m_toolbar_aviutl2/releases/latest)
 
 詳しくは紹介動画をご覧ください。
 
@@ -16,8 +16,8 @@
 * Aviutl ExEdit2 beta35
 
 ## 導入方法
-1. [Releaseページ](https://github.com/yuratexi/m_split_timeline_aviutl2/releases/latest)のAssets欄からm_split_timeline_aviutl2.zipをダウンロード
-2. zipファイルを展開して出てきた"m_split_timeline_aviutl2.aux2"をaviutl2にドラッグアンドドロップ
+1. [Releaseページ](https://github.com/yuratexi/m_toolbar_aviutl2/releases/latest)のAssets欄からau2pkg.zipをダウンロード
+2. zipファイルを**展開せずに**、そのままAviUtl2にドラッグアンドドロップで導入できます。
 
 ## 仕様
 紹介動画のほうで詳しく解説してます。ですがこちらにも一応ざっくり書きます。
