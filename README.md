@@ -353,7 +353,7 @@ JPEG出力,command,JPEGファイル出力
 
 
 ## クレジット
-* AviUtlのお部屋 [https://spring-fragrance.mints.ne.jp/aviutl/](https://spring-fragrance.mints.ne.jp/aviutl/)]
+* AviUtlのお部屋 [https://spring-fragrance.mints.ne.jp/aviutl/](https://spring-fragrance.mints.ne.jp/aviutl/)
 * 拡張ツールバー [https://aoytsk.blog.jp/aviutl/422768.html](https://aoytsk.blog.jp/aviutl/422768.html)
 * Visual Studio Image Library [https://www.microsoft.com/en-us/download/details.aspx?id=35825](https://www.microsoft.com/en-us/download/details.aspx?id=35825)
 
