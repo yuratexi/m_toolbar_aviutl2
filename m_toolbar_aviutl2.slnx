@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="m_toolbar_aviutl2/m_toolbar_aviutl2.vcxproj" Id="349cc803-5f3f-4081-b267-bca9c35e2fce" />
+</Solution>
