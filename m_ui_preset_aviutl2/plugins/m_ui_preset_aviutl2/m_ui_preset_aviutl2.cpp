@@ -1,6 +1,6 @@
 //----------------------------------------------------------------------------------
 //	UIプリセット プラグイン for AviUtl ExEdit2
-//	プロジェクトのアスペクト比ごとに UI レイアウトを保存・適用する
+//	名前付き UI レイアウトを用意し、ユーザーが選んでプロジェクトに紐づける
 //----------------------------------------------------------------------------------
 #include <windows.h>
 #include <shellapi.h>
@@ -9,7 +9,6 @@
 #pragma comment(lib, "shell32.lib")
 
 #include <algorithm>
-#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -25,32 +24,44 @@
 
 #define PLUGIN_NAME       L"UIプリセット"
 #define PANEL_WINDOW_NAME L"UIプリセット"
-#define IDC_BTN_SAVE      1001
+
+// プロジェクトファイルへ保存するキー (プラグイン固有領域 / UTF-8)
+static const char* k_project_preset_key = "ui_preset";
+
+#define IDC_LIST          1001
 #define IDC_BTN_APPLY     1002
-#define IDC_BTN_LIST      1003
+#define IDC_BTN_SAVE      1003
 #define IDC_BTN_DELETE    1004
-#define IDC_BTN_AUTO      1005
-#define IDC_LBL_RATIO     1101
-#define IDC_LBL_STATUS    1102
+#define IDC_BTN_DEFAULT   1005
+#define IDC_BTN_BIND      1006
+#define IDC_BTN_FOLDER    1007
+#define IDC_LBL_INFO      1101
+#define IDC_LBL_PROJECT   1102
+#define IDC_LBL_DEFAULT   1103
+#define IDC_EDIT_NAME     1201
+#define IDC_EDIT_RATIO    1202
+#define IDOK_SAVE_DLG     1
+#define IDCANCEL_SAVE_DLG 2
 
 static HINSTANCE      g_hInst = nullptr;
 static LOG_HANDLE*    logger  = nullptr;
 static CONFIG_HANDLE* config  = nullptr;
 static EDIT_HANDLE*   edit_handle = nullptr;
-static HWND           g_hwnd_panel = nullptr;
-static HWND           g_hwnd_ratio = nullptr;
-static HWND           g_hwnd_status = nullptr;
-static HWND           g_hwnd_auto = nullptr;
+
+static HWND g_hwnd_panel   = nullptr;
+static HWND g_hwnd_list    = nullptr;
+static HWND g_hwnd_info    = nullptr;
+static HWND g_hwnd_project = nullptr;
+static HWND g_hwnd_default = nullptr;
 
 static std::wstring g_plugin_dir;
 static std::wstring g_presets_path;
 static std::wstring g_config_path;
 
-static bool  g_auto_apply = true;
-static double g_match_tolerance = 0.02; // |a-b| / max(a,b) の許容
-static int   g_last_w = 0;
-static int   g_last_h = 0;
-static bool  g_applying = false;
+static std::wstring g_default_preset;   // グローバル既定プリセット名
+static std::wstring g_project_preset;   // 現プロジェクトに紐づく名前 (未設定は空)
+static std::wstring g_selected_preset;  // パネルで選択中
+static bool         g_applying = false;
 
 //---------------------------------------------------------------------
 //	DllMain
@@ -86,8 +97,39 @@ static void warnf(const wchar_t* fmt, ...) {
 }
 
 //---------------------------------------------------------------------
-//	パス / ディレクトリ
+//	文字列 / パス
 //---------------------------------------------------------------------
+static std::string narrow_utf8(const std::wstring& ws) {
+	if (ws.empty()) return {};
+	int n = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
+	std::string s(n, '\0');
+	WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], n, nullptr, nullptr);
+	return s;
+}
+
+static std::wstring widen_utf8(const std::string& s) {
+	if (s.empty()) return {};
+	int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+	std::wstring ws(n, L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &ws[0], n);
+	return ws;
+}
+
+static std::wstring trim_ws(std::wstring s) {
+	while (!s.empty() && iswspace(s.front())) s.erase(s.begin());
+	while (!s.empty() && iswspace(s.back())) s.pop_back();
+	return s;
+}
+
+static bool is_safe_preset_name(const std::wstring& name) {
+	if (name.empty() || name.size() > 64) return false;
+	if (name == L"settings" || name == L"default") return false;
+	for (wchar_t c : name) {
+		if (c == L'[' || c == L']' || c == L'=' || c == L'\n' || c == L'\r' || c == L'\\') return false;
+	}
+	return true;
+}
+
 static std::wstring join_path(std::wstring base, const wchar_t* leaf) {
 	if (!base.empty() && base.back() != L'\\' && base.back() != L'/') base += L'\\';
 	base += leaf;
@@ -96,9 +138,7 @@ static std::wstring join_path(std::wstring base, const wchar_t* leaf) {
 
 static void ensure_plugin_dirs() {
 	std::wstring base;
-	if (config && config->app_data_path) {
-		base = config->app_data_path;
-	}
+	if (config && config->app_data_path) base = config->app_data_path;
 	if (base.empty()) {
 		wchar_t mod[MAX_PATH] = {};
 		GetModuleFileNameW(g_hInst, mod, MAX_PATH);
@@ -114,7 +154,7 @@ static void ensure_plugin_dirs() {
 }
 
 //---------------------------------------------------------------------
-//	アスペクト比ユーティリティ
+//	アスペクト比 (ラベル用。自動適用には使わない)
 //---------------------------------------------------------------------
 static int gcd_int(int a, int b) {
 	a = std::abs(a); b = std::abs(b);
@@ -122,77 +162,25 @@ static int gcd_int(int a, int b) {
 	return a ? a : 1;
 }
 
-struct AspectKey {
-	int w = 0;
-	int h = 0;
-	bool is_default = false;
-
-	std::string key() const {
-		if (is_default) return "default";
-		char buf[64];
-		sprintf_s(buf, "%d:%d", w, h);
-		return buf;
-	}
-
-	std::wstring wkey() const {
-		if (is_default) return L"default";
-		wchar_t buf[64];
-		swprintf_s(buf, L"%d:%d", w, h);
-		return buf;
-	}
-
-	double ratio() const {
-		if (h == 0) return 0.0;
-		return (double)w / (double)h;
-	}
-};
-
-static AspectKey make_aspect(int width, int height) {
-	AspectKey k;
-	if (width <= 0 || height <= 0) {
-		k.is_default = true;
-		return k;
-	}
-	int g = gcd_int(width, height);
-	k.w = width / g;
-	k.h = height / g;
-	return k;
+static std::wstring ratio_label_from_size(int w, int h) {
+	if (w <= 0 || h <= 0) return L"";
+	int g = gcd_int(w, h);
+	wchar_t buf[32];
+	swprintf_s(buf, L"%d:%d", w / g, h / g);
+	return buf;
 }
 
-static AspectKey parse_aspect_key(const std::string& s) {
-	AspectKey k;
-	if (s == "default" || s.empty()) {
-		k.is_default = true;
-		return k;
-	}
-	int a = 0, b = 0;
-	if (sscanf_s(s.c_str(), "%d:%d", &a, &b) == 2 && a > 0 && b > 0) {
-		int g = gcd_int(a, b);
-		k.w = a / g;
-		k.h = b / g;
-		return k;
-	}
-	k.is_default = true;
-	return k;
-}
-
-static double relative_diff(double a, double b) {
-	const double m = (std::max)(std::abs(a), std::abs(b));
-	if (m < 1e-9) return 0.0;
-	return std::abs(a - b) / m;
+static bool get_current_scene_size(int* w, int* h) {
+	if (!edit_handle || !w || !h) return false;
+	EDIT_INFO info = {};
+	edit_handle->get_edit_info(&info, sizeof(info));
+	*w = info.width;
+	*h = info.height;
+	return (*w > 0 && *h > 0);
 }
 
 //---------------------------------------------------------------------
-//	レイアウトスナップショット
-//
-//	保存できるもの:
-//	  - ホストメインウィンドウの WINDOWPLACEMENT
-//	  - 同一プロセスのトップレベルウィンドウ (分離パネル等) の配置・表示状態
-//	  - ホスト直下のタイトル付き子ウィンドウ (パネル候補) の相対矩形・表示状態
-//	  - シーン解像度 (参考情報)
-//	保存できないもの (SDK/公開APIが無い):
-//	  - ドッキング分割ツリー / タブグループ構成そのもの
-//	  - AviUtl2 本体の「レイアウト設定」バイナリ形式
+//	レイアウトスナップショット (Win32 で取れる範囲)
 //---------------------------------------------------------------------
 struct WindowEntry {
 	std::wstring title;
@@ -211,14 +199,12 @@ struct LayoutSnapshot {
 };
 
 struct Preset {
-	AspectKey key;
-	int scene_w = 0;
-	int scene_h = 0;
+	std::wstring name;
+	std::wstring ratio; // 組織用ラベル (例: 16:9)。空でも可
 	LayoutSnapshot layout;
-	std::wstring note;
 };
 
-static std::map<std::string, Preset> g_presets;
+static std::map<std::wstring, Preset> g_presets; // name -> preset
 
 struct EnumCtx {
 	DWORD pid = 0;
@@ -238,17 +224,14 @@ static BOOL CALLBACK enum_top_level_proc(HWND hwnd, LPARAM lp) {
 	auto* ctx = reinterpret_cast<EnumCtx*>(lp);
 	DWORD pid = 0;
 	GetWindowThreadProcessId(hwnd, &pid);
-	if (pid != ctx->pid) return TRUE;
-	if (hwnd == ctx->host) return TRUE;
-	if (!IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
-		// 非表示のトップレベルもタイトルがあれば記録
-	}
+	if (pid != ctx->pid || hwnd == ctx->host) return TRUE;
+
 	LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
 	if (!(style & WS_CAPTION) && !(style & WS_POPUP)) return TRUE;
 
 	std::wstring title;
 	if (!get_window_title(hwnd, title)) return TRUE;
-	if (title == PANEL_WINDOW_NAME) return TRUE; // 自パネルは除外
+	if (title == PANEL_WINDOW_NAME) return TRUE;
 
 	WINDOWPLACEMENT wp = {};
 	wp.length = sizeof(wp);
@@ -269,7 +252,6 @@ static BOOL CALLBACK enum_top_level_proc(HWND hwnd, LPARAM lp) {
 
 static BOOL CALLBACK enum_child_proc(HWND hwnd, LPARAM lp) {
 	auto* ctx = reinterpret_cast<EnumCtx*>(lp);
-	// 直下の子のみ (孫はドッキング内部構造なのでスキップ)
 	if (GetParent(hwnd) != ctx->host) return TRUE;
 
 	std::wstring title;
@@ -305,9 +287,7 @@ static bool capture_layout(LayoutSnapshot& snap, int scene_w, int scene_h) {
 	if (!host) return false;
 
 	snap.host.length = sizeof(snap.host);
-	if (GetWindowPlacement(host, &snap.host)) {
-		snap.has_host = true;
-	}
+	if (GetWindowPlacement(host, &snap.host)) snap.has_host = true;
 
 	EnumCtx ctx;
 	ctx.pid = GetCurrentProcessId();
@@ -322,7 +302,6 @@ struct FindByTitle {
 	const std::wstring* title = nullptr;
 	HWND found = nullptr;
 	HWND host = nullptr;
-	bool top_level = false;
 	DWORD pid = 0;
 };
 
@@ -330,14 +309,10 @@ static BOOL CALLBACK find_top_proc(HWND hwnd, LPARAM lp) {
 	auto* ctx = reinterpret_cast<FindByTitle*>(lp);
 	DWORD pid = 0;
 	GetWindowThreadProcessId(hwnd, &pid);
-	if (pid != ctx->pid) return TRUE;
-	if (hwnd == ctx->host) return TRUE;
+	if (pid != ctx->pid || hwnd == ctx->host) return TRUE;
 	std::wstring title;
 	if (!get_window_title(hwnd, title)) return TRUE;
-	if (title == *ctx->title) {
-		ctx->found = hwnd;
-		return FALSE;
-	}
+	if (title == *ctx->title) { ctx->found = hwnd; return FALSE; }
 	return TRUE;
 }
 
@@ -346,10 +321,7 @@ static BOOL CALLBACK find_child_proc(HWND hwnd, LPARAM lp) {
 	if (GetParent(hwnd) != ctx->host) return TRUE;
 	std::wstring title;
 	if (!get_window_title(hwnd, title)) return TRUE;
-	if (title == *ctx->title) {
-		ctx->found = hwnd;
-		return FALSE;
-	}
+	if (title == *ctx->title) { ctx->found = hwnd; return FALSE; }
 	return TRUE;
 }
 
@@ -357,13 +329,9 @@ static HWND find_window_by_title(HWND host, const WindowEntry& e) {
 	FindByTitle ctx;
 	ctx.title = &e.title;
 	ctx.host = host;
-	ctx.top_level = e.top_level;
 	ctx.pid = GetCurrentProcessId();
-	if (e.top_level) {
-		EnumWindows(find_top_proc, reinterpret_cast<LPARAM>(&ctx));
-	} else {
-		EnumChildWindows(host, find_child_proc, reinterpret_cast<LPARAM>(&ctx));
-	}
+	if (e.top_level) EnumWindows(find_top_proc, reinterpret_cast<LPARAM>(&ctx));
+	else EnumChildWindows(host, find_child_proc, reinterpret_cast<LPARAM>(&ctx));
 	return ctx.found;
 }
 
@@ -373,80 +341,48 @@ static bool apply_layout(const LayoutSnapshot& snap) {
 	if (!host) return false;
 
 	g_applying = true;
-
 	if (snap.has_host) {
 		WINDOWPLACEMENT wp = snap.host;
 		wp.length = sizeof(wp);
 		SetWindowPlacement(host, &wp);
 	}
 
-	int applied = 0;
-	int missing = 0;
+	int applied = 0, missing = 0;
 	for (const auto& e : snap.windows) {
 		HWND hwnd = find_window_by_title(host, e);
-		if (!hwnd) {
-			++missing;
-			continue;
-		}
+		if (!hwnd) { ++missing; continue; }
 		if (e.top_level) {
 			WINDOWPLACEMENT wp = {};
 			wp.length = sizeof(wp);
 			GetWindowPlacement(hwnd, &wp);
-			wp.rcNormalPosition.left = e.left;
-			wp.rcNormalPosition.top = e.top;
-			wp.rcNormalPosition.right = e.right;
-			wp.rcNormalPosition.bottom = e.bottom;
+			wp.rcNormalPosition = { e.left, e.top, e.right, e.bottom };
 			wp.showCmd = e.visible ? SW_SHOWNORMAL : SW_HIDE;
 			SetWindowPlacement(hwnd, &wp);
 		} else {
 			const int w = e.right - e.left;
 			const int h = e.bottom - e.top;
 			if (w > 0 && h > 0) {
-				SetWindowPos(hwnd, nullptr, e.left, e.top, w, h,
-					SWP_NOZORDER | SWP_NOACTIVATE);
+				SetWindowPos(hwnd, nullptr, e.left, e.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
 			}
 			ShowWindow(hwnd, e.visible ? SW_SHOW : SW_HIDE);
 		}
 		++applied;
 	}
-
 	g_applying = false;
-	logf(L"[UIプリセット] 適用: %d ウィンドウ (未検出 %d)", applied, missing);
+	logf(L"[UIプリセット] レイアウト適用: %d 窓 (未検出 %d)", applied, missing);
 	return applied > 0 || snap.has_host;
 }
 
 //---------------------------------------------------------------------
-//	INI シリアライズ
+//	シリアライズ
 //---------------------------------------------------------------------
-static std::string narrow_utf8(const std::wstring& ws) {
-	if (ws.empty()) return {};
-	int n = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
-	std::string s(n, '\0');
-	WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], n, nullptr, nullptr);
-	return s;
-}
-
-static std::wstring widen_utf8(const std::string& s) {
-	if (s.empty()) return {};
-	int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-	std::wstring ws(n, L'\0');
-	MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &ws[0], n);
-	return ws;
-}
-
 static std::string escape_title(const std::wstring& title) {
 	std::string s = narrow_utf8(title);
 	std::string out;
 	out.reserve(s.size());
 	for (char c : s) {
-		if (c == '|' || c == ';' || c == '\\') {
-			out.push_back('\\');
-			out.push_back(c);
-		} else if (c == '\n' || c == '\r') {
-			continue;
-		} else {
-			out.push_back(c);
-		}
+		if (c == '|' || c == ';' || c == '\\') { out.push_back('\\'); out.push_back(c); }
+		else if (c != '\n' && c != '\r') out.push_back(c);
 	}
 	return out;
 }
@@ -455,11 +391,8 @@ static std::wstring unescape_title(const std::string& s) {
 	std::string out;
 	out.reserve(s.size());
 	for (size_t i = 0; i < s.size(); ++i) {
-		if (s[i] == '\\' && i + 1 < s.size()) {
-			out.push_back(s[++i]);
-		} else {
-			out.push_back(s[i]);
-		}
+		if (s[i] == '\\' && i + 1 < s.size()) out.push_back(s[++i]);
+		else out.push_back(s[i]);
 	}
 	return widen_utf8(out);
 }
@@ -484,12 +417,7 @@ static std::vector<WindowEntry> deserialize_windows(const std::string& s) {
 	while (i < s.size()) {
 		std::string piece;
 		while (i < s.size()) {
-			if (s[i] == '\\' && i + 1 < s.size()) {
-				piece.push_back(s[i]);
-				piece.push_back(s[i + 1]);
-				i += 2;
-				continue;
-			}
+			if (s[i] == '\\' && i + 1 < s.size()) { piece.push_back(s[i]); piece.push_back(s[i + 1]); i += 2; continue; }
 			if (s[i] == ';') { ++i; break; }
 			piece.push_back(s[i++]);
 		}
@@ -498,18 +426,9 @@ static std::vector<WindowEntry> deserialize_windows(const std::string& s) {
 		std::vector<std::string> parts;
 		std::string cur;
 		for (size_t j = 0; j < piece.size(); ++j) {
-			if (piece[j] == '\\' && j + 1 < piece.size()) {
-				cur.push_back(piece[j]);
-				cur.push_back(piece[j + 1]);
-				++j;
-				continue;
-			}
-			if (piece[j] == '|') {
-				parts.push_back(cur);
-				cur.clear();
-			} else {
-				cur.push_back(piece[j]);
-			}
+			if (piece[j] == '\\' && j + 1 < piece.size()) { cur.push_back(piece[j]); cur.push_back(piece[++j]); continue; }
+			if (piece[j] == '|') { parts.push_back(cur); cur.clear(); }
+			else cur.push_back(piece[j]);
 		}
 		parts.push_back(cur);
 		if (parts.size() < 4) continue;
@@ -527,6 +446,32 @@ static std::vector<WindowEntry> deserialize_windows(const std::string& s) {
 	return out;
 }
 
+static void save_config_file() {
+	ensure_plugin_dirs();
+	std::ofstream f(g_config_path.c_str(), std::ios::binary);
+	if (!f.is_open()) return;
+	f.write("\xEF\xBB\xBF", 3);
+	f << "default_preset=" << narrow_utf8(g_default_preset) << "\n";
+}
+
+static void load_config_file() {
+	g_default_preset.clear();
+	ensure_plugin_dirs();
+	std::ifstream f(g_config_path.c_str(), std::ios::binary);
+	if (!f.is_open()) return;
+	std::string line;
+	while (std::getline(f, line)) {
+		if (!line.empty() && (unsigned char)line[0] == 0xEF && line.size() >= 3) line = line.substr(3);
+		if (!line.empty() && line.back() == '\r') line.pop_back();
+		if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+		auto eq = line.find('=');
+		if (eq == std::string::npos) continue;
+		if (line.substr(0, eq) == "default_preset") {
+			g_default_preset = trim_ws(widen_utf8(line.substr(eq + 1)));
+		}
+	}
+}
+
 static void save_presets_file() {
 	ensure_plugin_dirs();
 	std::ofstream f(g_presets_path.c_str(), std::ios::binary);
@@ -535,27 +480,22 @@ static void save_presets_file() {
 		return;
 	}
 	f.write("\xEF\xBB\xBF", 3);
-	f << "# m_ui_preset_aviutl2 presets\n";
-	f << "# key = reduced aspect (e.g. 16:9) or default\n\n";
-	f << "[settings]\n";
-	f << "auto_apply=" << (g_auto_apply ? 1 : 0) << "\n";
-	f << "match_tolerance=" << g_match_tolerance << "\n\n";
+	f << "# m_ui_preset_aviutl2 named presets\n";
+	f << "# section name = preset name\n";
+	f << "# ratio = organizational label (e.g. 16:9), not used for auto-apply\n\n";
 
 	for (const auto& kv : g_presets) {
 		const Preset& p = kv.second;
-		f << "[" << kv.first << "]\n";
-		f << "scene_w=" << p.scene_w << "\n";
-		f << "scene_h=" << p.scene_h << "\n";
+		f << "[" << narrow_utf8(p.name) << "]\n";
+		if (!p.ratio.empty()) f << "ratio=" << narrow_utf8(p.ratio) << "\n";
+		f << "scene_w=" << p.layout.scene_w << "\n";
+		f << "scene_h=" << p.layout.scene_h << "\n";
 		if (p.layout.has_host) {
 			const auto& r = p.layout.host.rcNormalPosition;
 			f << "host=" << r.left << "," << r.top << "," << r.right << "," << r.bottom
 			  << "," << p.layout.host.showCmd << "\n";
 		}
-		f << "windows=" << serialize_windows(p.layout.windows) << "\n";
-		if (!p.note.empty()) {
-			f << "note=" << narrow_utf8(p.note) << "\n";
-		}
-		f << "\n";
+		f << "windows=" << serialize_windows(p.layout.windows) << "\n\n";
 	}
 }
 
@@ -565,253 +505,416 @@ static void load_presets_file() {
 	std::ifstream f(g_presets_path.c_str(), std::ios::binary);
 	if (!f.is_open()) return;
 
-	std::string line;
-	std::string section;
+	std::string line, section;
 	Preset cur;
-	bool in_settings = false;
-
 	auto flush = [&]() {
-		if (!section.empty() && section != "settings") {
-			cur.key = parse_aspect_key(section);
-			g_presets[section] = cur;
+		if (section.empty() || section == "settings") return;
+		cur.name = widen_utf8(section);
+		if (!is_safe_preset_name(cur.name) && cur.name != L"default") {
+			// 旧形式の "16:9" キーも名前として許容
 		}
+		if (!cur.name.empty()) g_presets[cur.name] = cur;
 		cur = {};
 	};
 
 	while (std::getline(f, line)) {
-		if (!line.empty() && (unsigned char)line[0] == 0xEF) {
-			// UTF-8 BOM
-			if (line.size() >= 3) line = line.substr(3);
-		}
+		if (!line.empty() && (unsigned char)line[0] == 0xEF && line.size() >= 3) line = line.substr(3);
 		if (!line.empty() && line.back() == '\r') line.pop_back();
 		if (line.empty() || line[0] == '#' || line[0] == ';') continue;
-
 		if (line.front() == '[' && line.back() == ']') {
 			flush();
 			section = line.substr(1, line.size() - 2);
-			in_settings = (section == "settings");
 			continue;
 		}
-
 		auto eq = line.find('=');
 		if (eq == std::string::npos) continue;
 		std::string key = line.substr(0, eq);
 		std::string val = line.substr(eq + 1);
 
-		if (in_settings) {
-			if (key == "auto_apply") {
-				try { g_auto_apply = (std::stoi(val) != 0); } catch (...) {}
-			} else if (key == "match_tolerance") {
-				try {
-					g_match_tolerance = std::stod(val);
-					if (g_match_tolerance < 0.0) g_match_tolerance = 0.0;
-					if (g_match_tolerance > 0.5) g_match_tolerance = 0.5;
-				} catch (...) {}
-			}
-			continue;
-		}
+		// 旧 settings セクションは無視 (auto_apply 等は廃止)
+		if (section == "settings") continue;
 
-		if (key == "scene_w") {
-			try { cur.scene_w = std::stoi(val); } catch (...) {}
-		} else if (key == "scene_h") {
-			try { cur.scene_h = std::stoi(val); } catch (...) {}
-		} else if (key == "host") {
+		if (key == "ratio") cur.ratio = widen_utf8(val);
+		else if (key == "scene_w") { try { cur.layout.scene_w = std::stoi(val); } catch (...) {} }
+		else if (key == "scene_h") { try { cur.layout.scene_h = std::stoi(val); } catch (...) {} }
+		else if (key == "host") {
 			int l=0,t=0,r=0,b=0; UINT sc = SW_SHOWNORMAL;
 			if (sscanf_s(val.c_str(), "%d,%d,%d,%d,%u", &l, &t, &r, &b, &sc) >= 4) {
 				cur.layout.has_host = true;
 				cur.layout.host.length = sizeof(WINDOWPLACEMENT);
-				cur.layout.host.flags = 0;
 				cur.layout.host.showCmd = sc;
 				cur.layout.host.rcNormalPosition = { l, t, r, b };
 			}
 		} else if (key == "windows") {
 			cur.layout.windows = deserialize_windows(val);
-		} else if (key == "note") {
-			cur.note = widen_utf8(val);
 		}
 	}
 	flush();
-	logf(L"[UIプリセット] プリセット %zu 件を読み込みました", g_presets.size());
+	logf(L"[UIプリセット] プリセット %zu 件を読み込み", g_presets.size());
 }
 
 //---------------------------------------------------------------------
-//	マッチング
+//	プロジェクト紐づけ (PROJECT_FILE プラグイン領域)
 //---------------------------------------------------------------------
-static const Preset* find_matching_preset(const AspectKey& current) {
-	if (current.is_default) {
-		auto it = g_presets.find("default");
-		return (it == g_presets.end()) ? nullptr : &it->second;
+struct ProjectBindParam {
+	std::wstring name;
+	bool clear = false;
+	bool ok = false;
+};
+
+static void write_project_preset_cb(void* p, EDIT_SECTION* edit) {
+	auto* param = static_cast<ProjectBindParam*>(p);
+	if (!edit || !edit_handle) return;
+	PROJECT_FILE* proj = edit->get_project_file(edit_handle);
+	if (!proj) {
+		warnf(L"PROJECT_FILE を取得できません");
+		return;
 	}
-
-	// 1) 約分キー完全一致
-	auto it = g_presets.find(current.key());
-	if (it != g_presets.end()) return &it->second;
-
-	// 2) 相対差が許容内の最近傍
-	const double cur = current.ratio();
-	const Preset* best = nullptr;
-	double best_diff = 1e9;
-	for (const auto& kv : g_presets) {
-		if (kv.second.key.is_default) continue;
-		double d = relative_diff(cur, kv.second.key.ratio());
-		if (d < best_diff) {
-			best_diff = d;
-			best = &kv.second;
-		}
-	}
-	if (best && best_diff <= g_match_tolerance) return best;
-
-	// 3) default フォールバック
-	auto def = g_presets.find("default");
-	if (def != g_presets.end()) return &def->second;
-	return nullptr;
-}
-
-static bool get_current_scene_size(int* w, int* h) {
-	if (!edit_handle || !w || !h) return false;
-	EDIT_INFO info = {};
-	edit_handle->get_edit_info(&info, sizeof(info));
-	*w = info.width;
-	*h = info.height;
-	return (*w > 0 && *h > 0);
-}
-
-//---------------------------------------------------------------------
-//	パネル UI 更新
-//---------------------------------------------------------------------
-static void update_panel_ui() {
-	if (!g_hwnd_ratio) return;
-	int w = 0, h = 0;
-	wchar_t buf[128];
-	if (get_current_scene_size(&w, &h)) {
-		AspectKey k = make_aspect(w, h);
-		swprintf_s(buf, L"現在: %dx%d (%s)", w, h, k.wkey().c_str());
+	if (param->clear || param->name.empty()) {
+		proj->set_param_string(k_project_preset_key, "");
 	} else {
-		swprintf_s(buf, L"現在: (シーン未取得)");
+		proj->set_param_string(k_project_preset_key, narrow_utf8(param->name).c_str());
 	}
-	SetWindowTextW(g_hwnd_ratio, buf);
+	param->ok = true;
+}
 
-	if (g_hwnd_status) {
-		AspectKey k = make_aspect(w, h);
-		const Preset* p = find_matching_preset(k);
-		if (p) {
-			swprintf_s(buf, L"マッチ: %s (%zu win)", p->key.wkey().c_str(), p->layout.windows.size());
+static bool bind_preset_to_project(const std::wstring& name) {
+	if (!edit_handle) return false;
+	ProjectBindParam param;
+	param.name = name;
+	param.clear = name.empty();
+	if (!edit_handle->call_edit_section_param(&param, write_project_preset_cb)) {
+		warnf(L"プロジェクトへの書き込みに失敗 (編集ロック不可?)");
+		return false;
+	}
+	if (!param.ok) return false;
+	g_project_preset = name;
+	logf(L"[UIプリセット] プロジェクト紐づけ: %s",
+		name.empty() ? L"(クリア)" : name.c_str());
+	return true;
+}
+
+static void on_project_save(PROJECT_FILE* project) {
+	if (!project) return;
+	// メモリ上の紐づけを確実に永続化
+	if (g_project_preset.empty()) {
+		project->set_param_string(k_project_preset_key, "");
+	} else {
+		project->set_param_string(k_project_preset_key, narrow_utf8(g_project_preset).c_str());
+	}
+}
+
+static bool apply_named_preset(const std::wstring& name, bool bind_project);
+
+static void on_project_load(PROJECT_FILE* project) {
+	g_project_preset.clear();
+	if (project) {
+		LPCSTR v = project->get_param_string(k_project_preset_key);
+		if (v && v[0]) g_project_preset = widen_utf8(v);
+	}
+
+	std::wstring to_apply;
+	if (!g_project_preset.empty() && g_presets.count(g_project_preset)) {
+		to_apply = g_project_preset;
+		logf(L"[UIプリセット] プロジェクト紐づけ '%s' を適用", to_apply.c_str());
+	} else if (!g_project_preset.empty()) {
+		warnf(L"プロジェクト指定のプリセット '%s' が見つかりません → 既定を試行",
+			g_project_preset.c_str());
+	}
+
+	if (to_apply.empty() && !g_default_preset.empty() && g_presets.count(g_default_preset)) {
+		to_apply = g_default_preset;
+		logf(L"[UIプリセット] 既定プリセット '%s' を適用", to_apply.c_str());
+	}
+
+	if (!to_apply.empty()) {
+		// ロード直後はウィンドウ再配置中のことがあるので適用のみ (再バインドしない)
+		apply_named_preset(to_apply, false);
+	}
+}
+
+//---------------------------------------------------------------------
+//	パネル UI
+//---------------------------------------------------------------------
+static void refresh_list() {
+	if (!g_hwnd_list) return;
+	SendMessageW(g_hwnd_list, LB_RESETCONTENT, 0, 0);
+	int select = -1;
+	int i = 0;
+	for (const auto& kv : g_presets) {
+		std::wstring label = kv.second.name;
+		if (!kv.second.ratio.empty()) label += L"  [" + kv.second.ratio + L"]";
+		SendMessageW(g_hwnd_list, LB_ADDSTRING, 0, (LPARAM)label.c_str());
+		if (!g_selected_preset.empty() && kv.first == g_selected_preset) select = i;
+		else if (g_selected_preset.empty() && !g_project_preset.empty() && kv.first == g_project_preset) select = i;
+		else if (g_selected_preset.empty() && g_project_preset.empty() && kv.first == g_default_preset) select = i;
+		++i;
+	}
+	if (select >= 0) SendMessageW(g_hwnd_list, LB_SETCURSEL, select, 0);
+}
+
+static std::wstring list_selected_name() {
+	if (!g_hwnd_list) return g_selected_preset;
+	int idx = (int)SendMessageW(g_hwnd_list, LB_GETCURSEL, 0, 0);
+	if (idx < 0) return {};
+	wchar_t buf[256] = {};
+	SendMessageW(g_hwnd_list, LB_GETTEXT, idx, (LPARAM)buf);
+	std::wstring label(buf);
+	auto br = label.find(L"  [");
+	if (br != std::wstring::npos) label = label.substr(0, br);
+	return trim_ws(label);
+}
+
+static void update_panel_labels() {
+	wchar_t buf[256];
+	int w = 0, h = 0;
+	if (g_hwnd_info) {
+		if (get_current_scene_size(&w, &h)) {
+			swprintf_s(buf, L"シーン: %dx%d (%s) ※ラベル参考", w, h, ratio_label_from_size(w, h).c_str());
 		} else {
-			swprintf_s(buf, L"マッチ: なし");
+			swprintf_s(buf, L"シーン: (未取得)");
 		}
-		SetWindowTextW(g_hwnd_status, buf);
+		SetWindowTextW(g_hwnd_info, buf);
 	}
-	if (g_hwnd_auto) {
-		SetWindowTextW(g_hwnd_auto, g_auto_apply ? L"自動適用: ON" : L"自動適用: OFF");
+	if (g_hwnd_project) {
+		if (g_project_preset.empty()) swprintf_s(buf, L"プロジェクト紐づけ: (なし)");
+		else swprintf_s(buf, L"プロジェクト紐づけ: %s", g_project_preset.c_str());
+		SetWindowTextW(g_hwnd_project, buf);
+	}
+	if (g_hwnd_default) {
+		if (g_default_preset.empty()) swprintf_s(buf, L"既定プリセット: (なし)");
+		else swprintf_s(buf, L"既定プリセット: %s", g_default_preset.c_str());
+		SetWindowTextW(g_hwnd_default, buf);
 	}
 }
 
-//---------------------------------------------------------------------
-//	操作本体
-//---------------------------------------------------------------------
-static void do_save_current() {
-	int w = 0, h = 0;
-	if (!get_current_scene_size(&w, &h)) {
-		warnf(L"シーン解像度を取得できません");
-		return;
-	}
-	AspectKey key = make_aspect(w, h);
-	LayoutSnapshot snap;
-	if (!capture_layout(snap, w, h)) {
-		warnf(L"レイアウトの取得に失敗しました");
-		return;
-	}
-
-	Preset p;
-	p.key = key;
-	p.scene_w = w;
-	p.scene_h = h;
-	p.layout = snap;
-	g_presets[key.key()] = p;
-	save_presets_file();
-	logf(L"[UIプリセット] 保存: %s (%dx%d) windows=%zu",
-		key.wkey().c_str(), w, h, snap.windows.size());
-	update_panel_ui();
+static void update_panel_ui() {
+	refresh_list();
+	update_panel_labels();
 }
 
-static void do_save_default() {
-	int w = 0, h = 0;
-	get_current_scene_size(&w, &h);
-	LayoutSnapshot snap;
-	if (!capture_layout(snap, w, h)) {
-		warnf(L"レイアウトの取得に失敗しました");
-		return;
-	}
-	Preset p;
-	p.key.is_default = true;
-	p.scene_w = w;
-	p.scene_h = h;
-	p.layout = snap;
-	g_presets["default"] = p;
-	save_presets_file();
-	logf(L"[UIプリセット] default を保存 (windows=%zu)", snap.windows.size());
-	update_panel_ui();
-}
-
-static bool do_apply_matching(bool quiet_if_missing) {
-	int w = 0, h = 0;
-	if (!get_current_scene_size(&w, &h)) {
-		if (!quiet_if_missing) warnf(L"シーン解像度を取得できません");
+static bool apply_named_preset(const std::wstring& name, bool bind_project) {
+	auto it = g_presets.find(name);
+	if (it == g_presets.end()) {
+		warnf(L"プリセット '%s' がありません", name.c_str());
 		return false;
 	}
-	AspectKey key = make_aspect(w, h);
-	const Preset* p = find_matching_preset(key);
-	if (!p) {
-		if (!quiet_if_missing) {
-			logf(L"[UIプリセット] %s に対応するプリセットがありません", key.wkey().c_str());
-		}
-		return false;
+	g_selected_preset = name;
+	bool ok = apply_layout(it->second.layout);
+	if (ok && bind_project) {
+		bind_preset_to_project(name);
 	}
-	logf(L"[UIプリセット] %s → プリセット %s を適用",
-		key.wkey().c_str(), p->key.wkey().c_str());
-	bool ok = apply_layout(p->layout);
 	update_panel_ui();
 	return ok;
 }
 
-static void do_list_presets() {
-	if (g_presets.empty()) {
-		logf(L"[UIプリセット] 登録なし");
-		return;
+//---------------------------------------------------------------------
+//	名前入力ダイアログ
+//---------------------------------------------------------------------
+struct SaveDlgData {
+	std::wstring name;
+	std::wstring ratio;
+	bool ok = false;
+};
+
+static LRESULT CALLBACK save_dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+	SaveDlgData* data = reinterpret_cast<SaveDlgData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+	switch (msg) {
+	case WM_CREATE: {
+		auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+		data = reinterpret_cast<SaveDlgData*>(cs->lpCreateParams);
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)data);
+		CreateWindowExW(0, WC_STATICW, L"プリセット名:", WS_CHILD | WS_VISIBLE,
+			12, 12, 260, 20, hwnd, nullptr, g_hInst, nullptr);
+		HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, data->name.c_str(),
+			WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+			12, 34, 300, 24, hwnd, (HMENU)IDC_EDIT_NAME, g_hInst, nullptr);
+		CreateWindowExW(0, WC_STATICW, L"比率ラベル (例 16:9 / 任意):", WS_CHILD | WS_VISIBLE,
+			12, 68, 260, 20, hwnd, nullptr, g_hInst, nullptr);
+		CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, data->ratio.c_str(),
+			WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+			12, 90, 300, 24, hwnd, (HMENU)IDC_EDIT_RATIO, g_hInst, nullptr);
+		CreateWindowExW(0, WC_BUTTONW, L"保存", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+			140, 130, 80, 28, hwnd, (HMENU)IDOK_SAVE_DLG, g_hInst, nullptr);
+		CreateWindowExW(0, WC_BUTTONW, L"キャンセル", WS_CHILD | WS_VISIBLE,
+			232, 130, 80, 28, hwnd, (HMENU)IDCANCEL_SAVE_DLG, g_hInst, nullptr);
+		SetFocus(edit);
+		return 0;
 	}
-	logf(L"[UIプリセット] ---- 一覧 (auto=%d tol=%.3f) ----",
-		g_auto_apply ? 1 : 0, g_match_tolerance);
-	for (const auto& kv : g_presets) {
-		const Preset& p = kv.second;
-		logf(L"  %s  scene=%dx%d  windows=%zu  host=%d",
-			p.key.wkey().c_str(), p.scene_w, p.scene_h,
-			p.layout.windows.size(), p.layout.has_host ? 1 : 0);
+	case WM_COMMAND:
+		if (LOWORD(wp) == IDOK_SAVE_DLG && data) {
+			wchar_t name[128] = {}, ratio[64] = {};
+			GetDlgItemTextW(hwnd, IDC_EDIT_NAME, name, _countof(name));
+			GetDlgItemTextW(hwnd, IDC_EDIT_RATIO, ratio, _countof(ratio));
+			data->name = trim_ws(name);
+			data->ratio = trim_ws(ratio);
+			if (!is_safe_preset_name(data->name)) {
+				MessageBoxW(hwnd, L"プリセット名が不正です。\n空・settings・[]=\\ 改行は使えません。",
+					PLUGIN_NAME, MB_OK | MB_ICONWARNING);
+				return 0;
+			}
+			data->ok = true;
+			DestroyWindow(hwnd);
+			return 0;
+		}
+		if (LOWORD(wp) == IDCANCEL_SAVE_DLG) {
+			DestroyWindow(hwnd);
+			return 0;
+		}
+		break;
+	case WM_CLOSE:
+		DestroyWindow(hwnd);
+		return 0;
 	}
+	return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static void do_delete_current() {
+static bool prompt_save_name(HWND owner, std::wstring& name, std::wstring& ratio) {
+	static bool registered = false;
+	if (!registered) {
+		WNDCLASSEXW wc = {};
+		wc.cbSize = sizeof(wc);
+		wc.lpszClassName = L"m_ui_preset_save_dlg";
+		wc.lpfnWndProc = save_dlg_proc;
+		wc.hInstance = g_hInst;
+		wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+		wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+		RegisterClassExW(&wc);
+		registered = true;
+	}
+
+	SaveDlgData data;
+	data.name = name;
+	data.ratio = ratio;
+
+	HWND dlg = CreateWindowExW(
+		WS_EX_DLGMODALFRAME, L"m_ui_preset_save_dlg", L"UIプリセットを保存",
+		WS_CAPTION | WS_POPUP | WS_SYSMENU,
+		CW_USEDEFAULT, CW_USEDEFAULT, 340, 200,
+		owner, nullptr, g_hInst, &data);
+	if (!dlg) return false;
+
+	if (owner) EnableWindow(owner, FALSE);
+	ShowWindow(dlg, SW_SHOW);
+	MSG msg;
+	while (IsWindow(dlg)) {
+		const BOOL gm = GetMessageW(&msg, nullptr, 0, 0);
+		if (gm == 0) {
+			// ホストの WM_QUIT を奪わないよう付け直す
+			PostQuitMessage((int)msg.wParam);
+			break;
+		}
+		if (gm < 0) break;
+		if (!IsDialogMessageW(dlg, &msg)) {
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		}
+	}
+	if (owner) {
+		EnableWindow(owner, TRUE);
+		SetForegroundWindow(owner);
+	}
+
+	if (!data.ok) return false;
+	name = data.name;
+	ratio = data.ratio;
+	return true;
+}
+
+//---------------------------------------------------------------------
+//	操作
+//---------------------------------------------------------------------
+static void do_save_as() {
 	int w = 0, h = 0;
-	if (!get_current_scene_size(&w, &h)) {
-		warnf(L"シーン解像度を取得できません");
+	get_current_scene_size(&w, &h);
+
+	std::wstring name = g_selected_preset;
+	std::wstring ratio = ratio_label_from_size(w, h);
+	if (name.empty() && !ratio.empty()) name = ratio; // 初期案として比率文字列
+
+	HWND owner = g_hwnd_panel;
+	if (!owner && edit_handle) owner = edit_handle->get_host_app_window();
+	if (!prompt_save_name(owner, name, ratio)) return;
+
+	LayoutSnapshot snap;
+	if (!capture_layout(snap, w, h)) {
+		warnf(L"レイアウト取得に失敗");
 		return;
 	}
-	AspectKey key = make_aspect(w, h);
-	auto it = g_presets.find(key.key());
-	if (it == g_presets.end()) {
-		logf(L"[UIプリセット] %s のプリセットは存在しません", key.wkey().c_str());
-		return;
-	}
-	g_presets.erase(it);
+
+	Preset p;
+	p.name = name;
+	p.ratio = ratio;
+	p.layout = snap;
+	g_presets[name] = p;
+	g_selected_preset = name;
 	save_presets_file();
-	logf(L"[UIプリセット] 削除: %s", key.wkey().c_str());
+	logf(L"[UIプリセット] 保存: '%s' ratio=%s windows=%zu",
+		name.c_str(), ratio.c_str(), snap.windows.size());
 	update_panel_ui();
 }
 
-static void do_toggle_auto() {
-	g_auto_apply = !g_auto_apply;
+static void do_apply_selected(bool bind) {
+	std::wstring name = list_selected_name();
+	if (name.empty()) name = g_selected_preset;
+	if (name.empty()) {
+		warnf(L"プリセットが選択されていません");
+		return;
+	}
+	apply_named_preset(name, bind);
+}
+
+static void do_delete_selected() {
+	std::wstring name = list_selected_name();
+	if (name.empty()) {
+		warnf(L"削除するプリセットが選択されていません");
+		return;
+	}
+	g_presets.erase(name);
+	if (g_selected_preset == name) g_selected_preset.clear();
+	if (g_default_preset == name) {
+		g_default_preset.clear();
+		save_config_file();
+	}
+	if (g_project_preset == name) {
+		bind_preset_to_project(L"");
+	}
 	save_presets_file();
-	logf(L"[UIプリセット] 自動適用: %s", g_auto_apply ? L"ON" : L"OFF");
+	logf(L"[UIプリセット] 削除: '%s'", name.c_str());
 	update_panel_ui();
+}
+
+static void do_set_default() {
+	std::wstring name = list_selected_name();
+	if (name.empty() || !g_presets.count(name)) {
+		warnf(L"既定にするプリセットを選択してください");
+		return;
+	}
+	g_default_preset = name;
+	save_config_file();
+	logf(L"[UIプリセット] 既定プリセット: '%s'", name.c_str());
+	update_panel_ui();
+}
+
+static void do_bind_selected() {
+	std::wstring name = list_selected_name();
+	if (name.empty() || !g_presets.count(name)) {
+		warnf(L"プロジェクトに紐づけるプリセットを選択してください");
+		return;
+	}
+	if (bind_preset_to_project(name)) update_panel_ui();
+}
+
+static void do_list_log() {
+	logf(L"[UIプリセット] ---- 一覧 (default=%s / project=%s) ----",
+		g_default_preset.empty() ? L"(なし)" : g_default_preset.c_str(),
+		g_project_preset.empty() ? L"(なし)" : g_project_preset.c_str());
+	for (const auto& kv : g_presets) {
+		logf(L"  '%s'  ratio=%s  windows=%zu",
+			kv.second.name.c_str(),
+			kv.second.ratio.empty() ? L"-" : kv.second.ratio.c_str(),
+			kv.second.layout.windows.size());
+	}
 }
 
 static void do_open_folder() {
@@ -819,43 +922,20 @@ static void do_open_folder() {
 	ShellExecuteW(nullptr, L"open", g_plugin_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-static void maybe_auto_apply_from_scene(EDIT_SECTION* edit) {
-	if (!g_auto_apply || g_applying || !edit || !edit->info) return;
-	const int w = edit->info->width;
-	const int h = edit->info->height;
-	if (w <= 0 || h <= 0) return;
-	if (w == g_last_w && h == g_last_h) return;
-	g_last_w = w;
-	g_last_h = h;
-	update_panel_ui();
-	do_apply_matching(true);
-}
-
 //---------------------------------------------------------------------
-//	メニュー / シーン変更コールバック
+//	メニューコールバック
 //---------------------------------------------------------------------
-static void cb_save(void*) { do_save_current(); }
-static void cb_save_default(void*) { do_save_default(); }
-static void cb_apply(void*) { do_apply_matching(false); }
-static void cb_list(void*) { do_list_presets(); }
-static void cb_delete(void*) { do_delete_current(); }
-static void cb_toggle_auto(void*) { do_toggle_auto(); }
-static void cb_open_folder(void*) { do_open_folder(); }
+static void cb_save(void*) { do_save_as(); }
+static void cb_apply(void*) { do_apply_selected(true); }
+static void cb_bind(void*) { do_bind_selected(); }
+static void cb_default(void*) { do_set_default(); }
+static void cb_delete(void*) { do_delete_selected(); }
+static void cb_list(void*) { do_list_log(); }
+static void cb_folder(void*) { do_open_folder(); }
 
-static void on_change_scene(EDIT_SECTION* edit) {
-	maybe_auto_apply_from_scene(edit);
-}
-
-static void on_project_load(PROJECT_FILE*) {
-	// ロード直後はシーン情報が揃う前のことがあるので、少し遅延せず
-	// change_scene 側に任せる。ここでも現在値で試行する。
-	int w = 0, h = 0;
-	if (get_current_scene_size(&w, &h)) {
-		g_last_w = 0;
-		g_last_h = 0;
-		if (g_auto_apply) do_apply_matching(true);
-		update_panel_ui();
-	}
+static void on_change_scene(EDIT_SECTION* /*edit*/) {
+	// 比率スニッフによる自動適用はしない。ラベル表示だけ更新。
+	if (!g_applying) update_panel_labels();
 }
 
 //---------------------------------------------------------------------
@@ -869,37 +949,62 @@ static int layout_row_h() {
 	return 28;
 }
 
-static HWND make_button(HWND parent, int id, const wchar_t* text, int x, int y, int w, int h) {
-	return CreateWindowExW(
-		0, WC_BUTTONW, text,
-		WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-		x, y, w, h, parent, (HMENU)(INT_PTR)id, g_hInst, nullptr);
-}
-
-static HWND make_label(HWND parent, int id, const wchar_t* text, int x, int y, int w, int h) {
-	return CreateWindowExW(
-		0, WC_STATICW, text,
-		WS_VISIBLE | WS_CHILD | SS_LEFT,
-		x, y, w, h, parent, (HMENU)(INT_PTR)id, g_hInst, nullptr);
-}
-
 static LRESULT CALLBACK panel_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	switch (msg) {
-	case WM_COMMAND:
-		switch (LOWORD(wp)) {
-		case IDC_BTN_SAVE:   do_save_current(); break;
-		case IDC_BTN_APPLY:  do_apply_matching(false); break;
-		case IDC_BTN_LIST:   do_list_presets(); break;
-		case IDC_BTN_DELETE: do_delete_current(); break;
-		case IDC_BTN_AUTO:   do_toggle_auto(); break;
+	case WM_COMMAND: {
+		const int id = LOWORD(wp);
+		const int code = HIWORD(wp);
+		if (id == IDC_LIST && code == LBN_SELCHANGE) {
+			g_selected_preset = list_selected_name();
+			return 0;
+		}
+		if (id == IDC_LIST && code == LBN_DBLCLK) {
+			do_apply_selected(true);
+			return 0;
+		}
+		switch (id) {
+		case IDC_BTN_APPLY:   do_apply_selected(true); break;
+		case IDC_BTN_SAVE:    do_save_as(); break;
+		case IDC_BTN_DELETE:  do_delete_selected(); break;
+		case IDC_BTN_DEFAULT: do_set_default(); break;
+		case IDC_BTN_BIND:    do_bind_selected(); break;
+		case IDC_BTN_FOLDER:  do_open_folder(); break;
 		}
 		SetFocus(nullptr);
 		return 0;
-	case WM_SIZE:
-		update_panel_ui();
+	}
+	case WM_SIZE: {
+		RECT rc = {};
+		GetClientRect(hwnd, &rc);
+		const int pad = 8;
+		const int row = layout_row_h();
+		int y = pad;
+		const int cw = (std::max)(40, (int)rc.right - pad * 2);
+		if (g_hwnd_info) { SetWindowPos(g_hwnd_info, nullptr, pad, y, cw, row, SWP_NOZORDER); y += row + 2; }
+		if (g_hwnd_project) { SetWindowPos(g_hwnd_project, nullptr, pad, y, cw, row, SWP_NOZORDER); y += row + 2; }
+		if (g_hwnd_default) { SetWindowPos(g_hwnd_default, nullptr, pad, y, cw, row, SWP_NOZORDER); y += row + 4; }
+		const int list_h = (std::max)(60, (int)rc.bottom - y - (row + 4) * 3 - pad);
+		if (g_hwnd_list) { SetWindowPos(g_hwnd_list, nullptr, pad, y, cw, list_h, SWP_NOZORDER); y += list_h + 4; }
+		const int bw = (cw - 4) / 2;
+		auto place2 = [&](int id1, int id2) {
+			HWND a = GetDlgItem(hwnd, id1);
+			HWND b = GetDlgItem(hwnd, id2);
+			if (a) SetWindowPos(a, nullptr, pad, y, bw, row, SWP_NOZORDER);
+			if (b) SetWindowPos(b, nullptr, pad + bw + 4, y, bw, row, SWP_NOZORDER);
+			y += row + 4;
+		};
+		place2(IDC_BTN_APPLY, IDC_BTN_SAVE);
+		place2(IDC_BTN_BIND, IDC_BTN_DEFAULT);
+		place2(IDC_BTN_DELETE, IDC_BTN_FOLDER);
 		return 0;
 	}
+	}
 	return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static HWND make_btn(HWND parent, int id, const wchar_t* text) {
+	return CreateWindowExW(0, WC_BUTTONW, text, WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+		0, 0, 10, 10, parent, (HMENU)(INT_PTR)id, g_hInst, nullptr);
 }
 
 static void create_panel(HOST_APP_TABLE* host) {
@@ -913,42 +1018,39 @@ static void create_panel(HOST_APP_TABLE* host) {
 	RegisterClassExW(&wcex);
 
 	g_hwnd_panel = CreateWindowExW(
-		0, PANEL_WINDOW_NAME, PANEL_WINDOW_NAME,
-		WS_POPUP,
-		CW_USEDEFAULT, CW_USEDEFAULT, 280, 220,
+		0, PANEL_WINDOW_NAME, PANEL_WINDOW_NAME, WS_POPUP,
+		CW_USEDEFAULT, CW_USEDEFAULT, 320, 360,
 		nullptr, nullptr, g_hInst, nullptr);
 	if (!g_hwnd_panel) return;
 
-	const int row = layout_row_h();
-	const int pad = 8;
-	const int bw = 250;
-	int y = pad;
+	g_hwnd_info = CreateWindowExW(0, WC_STATICW, L"", WS_VISIBLE | WS_CHILD | SS_LEFT,
+		0, 0, 10, 10, g_hwnd_panel, (HMENU)IDC_LBL_INFO, g_hInst, nullptr);
+	g_hwnd_project = CreateWindowExW(0, WC_STATICW, L"", WS_VISIBLE | WS_CHILD | SS_LEFT,
+		0, 0, 10, 10, g_hwnd_panel, (HMENU)IDC_LBL_PROJECT, g_hInst, nullptr);
+	g_hwnd_default = CreateWindowExW(0, WC_STATICW, L"", WS_VISIBLE | WS_CHILD | SS_LEFT,
+		0, 0, 10, 10, g_hwnd_panel, (HMENU)IDC_LBL_DEFAULT, g_hInst, nullptr);
+	g_hwnd_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTBOXW, L"",
+		WS_VISIBLE | WS_CHILD | WS_VSCROLL | LBS_NOTIFY,
+		0, 0, 10, 10, g_hwnd_panel, (HMENU)IDC_LIST, g_hInst, nullptr);
 
-	g_hwnd_ratio = make_label(g_hwnd_panel, IDC_LBL_RATIO, L"現在: -", pad, y, bw, row);
-	y += row + 2;
-	g_hwnd_status = make_label(g_hwnd_panel, IDC_LBL_STATUS, L"マッチ: -", pad, y, bw, row);
-	y += row + 6;
-
-	make_button(g_hwnd_panel, IDC_BTN_SAVE, L"現在の比率で保存", pad, y, bw, row);
-	y += row + 4;
-	make_button(g_hwnd_panel, IDC_BTN_APPLY, L"マッチするプリセットを適用", pad, y, bw, row);
-	y += row + 4;
-	make_button(g_hwnd_panel, IDC_BTN_LIST, L"プリセット一覧 (ログ)", pad, y, bw, row);
-	y += row + 4;
-	make_button(g_hwnd_panel, IDC_BTN_DELETE, L"現在の比率のプリセットを削除", pad, y, bw, row);
-	y += row + 4;
-	g_hwnd_auto = make_button(g_hwnd_panel, IDC_BTN_AUTO, L"自動適用: ON", pad, y, bw, row);
+	make_btn(g_hwnd_panel, IDC_BTN_APPLY, L"適用して紐づけ");
+	make_btn(g_hwnd_panel, IDC_BTN_SAVE, L"名前を付けて保存");
+	make_btn(g_hwnd_panel, IDC_BTN_BIND, L"プロジェクトに紐づけ");
+	make_btn(g_hwnd_panel, IDC_BTN_DEFAULT, L"既定に設定");
+	make_btn(g_hwnd_panel, IDC_BTN_DELETE, L"削除");
+	make_btn(g_hwnd_panel, IDC_BTN_FOLDER, L"フォルダ");
 
 	host->register_window_client(PANEL_WINDOW_NAME, g_hwnd_panel);
+	SendMessageW(g_hwnd_panel, WM_SIZE, 0, 0);
 	update_panel_ui();
 }
 
 //---------------------------------------------------------------------
-//	プラグイン入口
+//	入口
 //---------------------------------------------------------------------
 COMMON_PLUGIN_TABLE common_plugin_table = {
 	PLUGIN_NAME,
-	L"UIプリセット (アスペクト比) version 1.0",
+	L"UIプリセット (名前付き / プロジェクト紐づけ) version 1.1",
 };
 
 EXTERN_C __declspec(dllexport) DWORD RequiredVersion() {
@@ -972,10 +1074,7 @@ EXTERN_C __declspec(dllexport) bool InitializePlugin(DWORD /*version*/) {
 }
 
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
-	g_hwnd_panel = nullptr;
-	g_hwnd_ratio = nullptr;
-	g_hwnd_status = nullptr;
-	g_hwnd_auto = nullptr;
+	g_hwnd_panel = g_hwnd_list = g_hwnd_info = g_hwnd_project = g_hwnd_default = nullptr;
 }
 
 EXTERN_C __declspec(dllexport) COMMON_PLUGIN_TABLE* GetCommonPluginTable(void) {
@@ -984,22 +1083,25 @@ EXTERN_C __declspec(dllexport) COMMON_PLUGIN_TABLE* GetCommonPluginTable(void) {
 
 EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 	ensure_plugin_dirs();
+	load_config_file();
 	load_presets_file();
 
 	edit_handle = host->create_edit_handle();
 
-	host->register_edit_menu_param(L"UIプリセット\\現在の比率で保存", nullptr, cb_save);
-	host->register_edit_menu_param(L"UIプリセット\\defaultとして保存", nullptr, cb_save_default);
-	host->register_edit_menu_param(L"UIプリセット\\マッチするプリセットを適用", nullptr, cb_apply);
-	host->register_edit_menu_param(L"UIプリセット\\プリセット一覧をログに表示", nullptr, cb_list);
-	host->register_edit_menu_param(L"UIプリセット\\現在の比率のプリセットを削除", nullptr, cb_delete);
-	host->register_edit_menu_param(L"UIプリセット\\自動適用の切替", nullptr, cb_toggle_auto);
-	host->register_edit_menu_param(L"UIプリセット\\設定フォルダを開く", nullptr, cb_open_folder);
+	host->register_edit_menu_param(L"UIプリセット\\名前を付けて保存", nullptr, cb_save);
+	host->register_edit_menu_param(L"UIプリセット\\選択を適用して紐づけ", nullptr, cb_apply);
+	host->register_edit_menu_param(L"UIプリセット\\プロジェクトに紐づけ", nullptr, cb_bind);
+	host->register_edit_menu_param(L"UIプリセット\\選択を既定に設定", nullptr, cb_default);
+	host->register_edit_menu_param(L"UIプリセット\\選択を削除", nullptr, cb_delete);
+	host->register_edit_menu_param(L"UIプリセット\\一覧をログに表示", nullptr, cb_list);
+	host->register_edit_menu_param(L"UIプリセット\\設定フォルダを開く", nullptr, cb_folder);
 
-	host->register_change_scene_handler(on_change_scene);
 	host->register_project_load_handler(on_project_load);
+	host->register_project_save_handler(on_project_save);
+	host->register_change_scene_handler(on_change_scene);
 
 	create_panel(host);
-
-	logf(L"[UIプリセット] 初期化完了 (auto=%d)", g_auto_apply ? 1 : 0);
+	logf(L"[UIプリセット] 初期化完了 (presets=%zu default=%s)",
+		g_presets.size(),
+		g_default_preset.empty() ? L"(なし)" : g_default_preset.c_str());
 }
