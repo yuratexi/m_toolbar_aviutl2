@@ -9,11 +9,14 @@ rem    build.bat Release
 rem    build.bat Debug
 rem    build.bat clean
 rem    build.bat clean Release
+rem
+rem  Unicode パス向けに subst で ASCII ドライブレターへマップする。
+rem  ドライブレターが前回と違うと CMakeCache が壊れるので、
+rem  不一致を検出したら build\ を自動削除してから configure する。
 rem ============================================================
 
 set "CONFIG=Release"
 set "DO_CLEAN=0"
-set "SUBST_DRIVE=X:"
 
 :parse_args
 if "%~1"=="" goto args_done
@@ -36,29 +39,46 @@ echo [ERROR] Unknown argument: %~1
 exit /b 1
 :args_done
 
+rem Project root = this bat's directory (Unicode-safe via %~dp0)
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
-subst %SUBST_DRIVE% /d >nul 2>&1
-subst %SUBST_DRIVE% "%ROOT%"
-if errorlevel 1 (
-  echo [ERROR] subst %SUBST_DRIVE% failed.
+rem Pick a free subst drive (prefer X: like sibling plugins)
+set "SUBST_DRIVE="
+for %%D in (X W Y Z V U) do (
+  if not defined SUBST_DRIVE (
+    subst %%D: /d >nul 2>&1
+    subst %%D: "%ROOT%" >nul 2>&1
+    if exist "%%D:\CMakeLists.txt" (
+      set "SUBST_DRIVE=%%D:"
+    ) else (
+      subst %%D: /d >nul 2>&1
+    )
+  )
+)
+if not defined SUBST_DRIVE (
+  echo [ERROR] Could not subst an ASCII drive to "%ROOT%".
+  echo         Close other builds using X:/W:/Y:/... or free a drive letter.
   exit /b 1
 )
 if not exist "%SUBST_DRIVE%\CMakeLists.txt" (
   echo [ERROR] CMakeLists.txt not found on %SUBST_DRIVE%
+  subst %SUBST_DRIVE% /d >nul 2>&1
   exit /b 1
 )
 
+rem Locate Visual Studio
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" (
   echo [ERROR] vswhere.exe not found. Install Visual Studio with C++ desktop development.
+  subst %SUBST_DRIVE% /d >nul 2>&1
   exit /b 1
 )
 
 for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%I"
 if not defined VSINSTALL (
   echo [ERROR] Visual Studio with C++ toolset not found.
+  subst %SUBST_DRIVE% /d >nul 2>&1
   exit /b 1
 )
 
@@ -68,14 +88,17 @@ set "NINJA=%VSINSTALL%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.
 
 if not exist "%VCVARS%" (
   echo [ERROR] vcvars64.bat not found: %VCVARS%
+  subst %SUBST_DRIVE% /d >nul 2>&1
   exit /b 1
 )
 if not exist "%CMAKE%" (
   echo [ERROR] cmake.exe not found: %CMAKE%
+  subst %SUBST_DRIVE% /d >nul 2>&1
   exit /b 1
 )
 if not exist "%NINJA%" (
   echo [ERROR] ninja.exe not found: %NINJA%
+  subst %SUBST_DRIVE% /d >nul 2>&1
   exit /b 1
 )
 
@@ -88,6 +111,7 @@ echo.
 call "%VCVARS%" >nul
 if errorlevel 1 (
   echo [ERROR] Failed to load MSVC environment.
+  subst %SUBST_DRIVE% /d >nul 2>&1
   exit /b 1
 )
 
@@ -96,19 +120,36 @@ if "%DO_CLEAN%"=="1" (
   if exist "%SUBST_DRIVE%\build" rmdir /s /q "%SUBST_DRIVE%\build"
 )
 
+rem Drop stale CMake cache when previous configure used another subst letter/path
+rem (e.g. X:/build cache reused after mapping the same folder as W:)
+call :ensure_fresh_cmake_cache
+if errorlevel 1 (
+  subst %SUBST_DRIVE% /d >nul 2>&1
+  exit /b 1
+)
+
 if not exist "%SUBST_DRIVE%\build" mkdir "%SUBST_DRIVE%\build"
 
 echo ^>^>^> Configure
+rem Note: do not quote "%SUBST_DRIVE%\" — trailing \" escapes the quote in cmd.
 "%CMAKE%" -S %SUBST_DRIVE%\ -B %SUBST_DRIVE%\build -G Ninja -DCMAKE_BUILD_TYPE=%CONFIG% "-DCMAKE_MAKE_PROGRAM=%NINJA%"
 if errorlevel 1 (
-  echo [ERROR] CMake configure failed.
-  exit /b 1
+  echo [WARN] CMake configure failed — wiping build\ and retrying once...
+  if exist "%SUBST_DRIVE%\build" rmdir /s /q "%SUBST_DRIVE%\build"
+  mkdir "%SUBST_DRIVE%\build"
+  "%CMAKE%" -S %SUBST_DRIVE%\ -B %SUBST_DRIVE%\build -G Ninja -DCMAKE_BUILD_TYPE=%CONFIG% "-DCMAKE_MAKE_PROGRAM=%NINJA%"
+  if errorlevel 1 (
+    echo [ERROR] CMake configure failed.
+    subst %SUBST_DRIVE% /d >nul 2>&1
+    exit /b 1
+  )
 )
 
 echo ^>^>^> Build
 "%CMAKE%" --build %SUBST_DRIVE%\build --target m_ui_preset_aviutl2
 if errorlevel 1 (
   echo [ERROR] Build failed.
+  subst %SUBST_DRIVE% /d >nul 2>&1
   exit /b 1
 )
 
@@ -119,4 +160,29 @@ dir /b "%SUBST_DRIVE%\build\plugins\*.aux2" 2>nul
 echo.
 echo Build succeeded.
 echo Output: %ROOT%\build\plugins\m_ui_preset_aviutl2.aux2
+subst %SUBST_DRIVE% /d >nul 2>&1
+exit /b 0
+
+rem ------------------------------------------------------------
+rem ensure_fresh_cmake_cache
+rem If CMakeCache.txt remembers a different CMAKE_HOME_DIRECTORY
+rem than the current subst drive, delete build\.
+rem ------------------------------------------------------------
+:ensure_fresh_cmake_cache
+set "CACHE=%SUBST_DRIVE%\build\CMakeCache.txt"
+if not exist "%CACHE%" exit /b 0
+
+rem Match CMAKE_HOME_DIRECTORY:INTERNAL=<drive>  (X: / X:/ / x:\ …)
+findstr /I /C:"CMAKE_HOME_DIRECTORY:INTERNAL=%SUBST_DRIVE%" "%CACHE%" >nul 2>&1
+if not errorlevel 1 exit /b 0
+
+echo [WARN] Stale CMakeCache (configured under a different drive/path).
+echo        Expected CMAKE_HOME_DIRECTORY under %SUBST_DRIVE%
+echo        Cleaning "%ROOT%\build" ...
+rmdir /s /q "%SUBST_DRIVE%\build"
+if exist "%SUBST_DRIVE%\build" (
+  echo [ERROR] Could not remove build\. Close IDE/ninja locks and retry, or:
+  echo         rmdir /s /q build
+  exit /b 1
+)
 exit /b 0

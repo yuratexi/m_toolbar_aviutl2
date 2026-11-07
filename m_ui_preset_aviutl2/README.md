@@ -76,6 +76,19 @@ build.bat Release
 
 成果物: `m_ui_preset_aviutl2\build\plugins\m_ui_preset_aviutl2.aux2`
 
+### ビルドが CMakeCache で失敗する場合
+
+`subst` のドライブレターが前回と違うと、次のようなエラーになります。
+
+```text
+CMake Error: ... CMakeCache.txt ... different than the directory x:/build ...
+The source "W://CMakeLists.txt" does not match ... "X://CMakeLists.txt"
+```
+
+**一度きり:** プロジェクト直下で `rmdir /s /q build` してから `build.bat Release` を再実行。
+
+`build.bat` はキャッシュの `CMAKE_HOME_DIRECTORY` と今の subst ドライブが食い違っていれば `build\` を自動削除し、configure 失敗時も一度リトライします。
+
 ## リポジトリについて
 
 新規 GitHub リポジトリをこの環境から作成できなかったため、当面 `m_toolbar_aviutl2` 配下の自己完結フォルダとして置いています。独立リポ化は `NOTE_REPO.md` を参照。
